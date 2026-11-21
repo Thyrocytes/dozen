@@ -4,5 +4,5 @@
 #include <unistd.h>
 
 int main(void) {
-	return dozen_init("127.0.0.1", 3000);
+	 dozen_init("127.0.0.1", 3000);
 }
