@@ -61,14 +61,16 @@ typedef struct {
 } dozen_thread_details;
 
 typedef enum {
-	kAccept,
-	kRecv,
-	kSend,
+	kAccept = 1,
+	kRecv = 2,
+	kSend = 3,
+	kClose = 4,
 } dozen_op_type;
 
-void* dozen_thread_job(void* void_details);
-struct io_uring_sqe* dozen_get_sqe(struct io_uring* ring);
-void dozen_add_multishot(struct io_uring* ring, int socket_fd);
+static void* dozen_thread_job(void* void_details);
+static struct io_uring_sqe* dozen_get_sqe(struct io_uring* ring);
+static void dozen_add_multishot(struct io_uring* ring, int socket_fd);
+static void dozen_close(struct io_uring* ring, int client_fd);
 
 dozen_rs dozen_internal_routing_DONT_RENAME(dozen_cc request);
 
@@ -153,6 +155,10 @@ void* dozen_thread_job(void* void_details) {
 		dozen_error(socket_fd, "dozen: io_uring_queue_init_params() error\n");
 	}
 
+	if (io_uring_register_files_sparse(&ring, 1024) < 0) {
+		dozen_error(socket_fd, "dozen: io_uring_register_files_sparse error()\n");
+	}
+
 	char* buffers = malloc(DOZEN_BUFFERS * DOZEN_BUFFER_SIZE);
 	int err = 0;
 	struct io_uring_buf_ring* buffer_ring = io_uring_setup_buf_ring(&ring, DOZEN_BUFFERS, 0, 0, &err);
@@ -169,7 +175,7 @@ void* dozen_thread_job(void* void_details) {
 	io_uring_buf_ring_advance(buffer_ring, DOZEN_BUFFERS);
 
 	struct io_uring_sqe* sqe = dozen_get_sqe(&ring);
-	io_uring_prep_multishot_accept(sqe, socket_fd, NULL, NULL, 0);
+	io_uring_prep_multishot_accept_direct(sqe, socket_fd, NULL, NULL, 0);
 	sqe->user_data = dozen_data_pack(kAccept, socket_fd);
 
 	struct io_uring_cqe* cqe;
@@ -194,7 +200,7 @@ void* dozen_thread_job(void* void_details) {
 				
 				struct io_uring_sqe* sqe = dozen_get_sqe(&ring);
 				io_uring_prep_recv_multishot(sqe, client_fd, NULL, 0, 0);
-				sqe->flags |= IOSQE_BUFFER_SELECT;
+				sqe->flags |= IOSQE_BUFFER_SELECT | IOSQE_FIXED_FILE;
 				sqe->buf_group = 0;
 				io_uring_sqe_set_data64(sqe, dozen_data_pack(kRecv, client_fd));
 			}
@@ -202,7 +208,7 @@ void* dozen_thread_job(void* void_details) {
 			case kRecv: {
 				int client_fd = dozen_get_fd(cqe->user_data);
 				if (cqe->res == 0) {
-					close(client_fd);
+					dozen_close(&ring, client_fd);
 					break;
 				}
 
@@ -210,30 +216,32 @@ void* dozen_thread_job(void* void_details) {
 					if (cqe->res == -ENOBUFS) 
 						break;
 					
-					close(client_fd);
+					dozen_close(&ring, client_fd);
 					break;
 				}
 
 				int buffer_id = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
-				char* buf = buffers + buffer_id * DOZEN_BUFFER_SIZE;
-				buf[cqe->res] = '\0';
+				char* buffer = buffers + buffer_id * DOZEN_BUFFER_SIZE;
+				buffer[cqe->res] = '\0';
 
 				const char response[] = "HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\nHello Dozen!";
-				io_uring_buf_ring_add(buffer_ring, buf, DOZEN_BUFFER_SIZE, buffer_id, io_uring_buf_ring_mask(DOZEN_BUFFERS), 0);
+				io_uring_buf_ring_add(buffer_ring, buffer, DOZEN_BUFFER_SIZE, buffer_id, io_uring_buf_ring_mask(DOZEN_BUFFERS), 0);
 				io_uring_buf_ring_advance(buffer_ring, 1);
 
 				struct io_uring_sqe* sqe = dozen_get_sqe(&ring);
 				io_uring_prep_send(sqe, client_fd, response, sizeof(response) - 1, 0);
-				sqe->flags |= IOSQE_CQE_SKIP_SUCCESS;
+				sqe->flags |= IOSQE_CQE_SKIP_SUCCESS | IOSQE_FIXED_FILE;
 				io_uring_sqe_set_data64(sqe, dozen_data_pack(kSend, client_fd));
 			}
-			break;
+				break;
 			case kSend: {
 				if (cqe->res < 0) {
-					close(dozen_get_fd(cqe->user_data));
+					dozen_close(&ring, dozen_get_fd(cqe->user_data));
 				}
 			}
-			break;
+				break;
+			default:
+				break;
 			}
 			count++;
 		}
@@ -259,8 +267,15 @@ struct io_uring_sqe* dozen_get_sqe(struct io_uring* ring) {
 
 void dozen_add_multishot(struct io_uring* ring, int socket_fd) {
 	struct io_uring_sqe* sqe = dozen_get_sqe(ring);
-	io_uring_prep_multishot_accept(sqe, socket_fd, NULL, NULL, 0);
+	io_uring_prep_multishot_accept_direct(sqe, socket_fd, NULL, NULL, 0);
 	io_uring_sqe_set_data64(sqe, dozen_data_pack(kAccept, socket_fd));
+}
+
+void dozen_close(struct io_uring* ring, int client_fd) {
+	struct io_uring_sqe* sqe = dozen_get_sqe(ring);
+	io_uring_prep_close_direct(sqe, client_fd);
+	sqe->flags |= IOSQE_CQE_SKIP_SUCCESS;
+	io_uring_sqe_set_data64(sqe, dozen_data_pack(kClose, client_fd));
 }
 
 #endif
